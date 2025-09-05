@@ -8,3 +8,15 @@ MIME_ALLOW = {
         "application/zip",
     },
 }
+
+# Analyzer configuration
+READABILITY_TARGET = 55  # Flesch Reading Ease target
+LONG_SENTENCE_THRESHOLD = 25  # words
+PASSIVE_THRESHOLD_PCT = 20    # % passive sentences considered high
+
+WEIGHTS = {
+    "grammar": 0.45,
+    "style": 0.15,
+    "clarity": 0.20,
+    "readability": 0.20,
+}
