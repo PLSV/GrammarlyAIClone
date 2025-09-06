@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, shutil
+import os, shutil, re
 from typing import List, Literal
 from language_tool_python import LanguageTool
 import docx
@@ -97,57 +97,117 @@ def revise_document(in_path: str, out_dir: str, fmt: Literal["docx", "txt", "pdf
     out_path = os.path.join(out_dir, "corrected.docx")
     return write_docx(corrected, out_path)
 
+def _measure_width(page: fitz.Page, text: str, fontname: str, fontsize: float) -> float:
+    """
+    Cross-version width measurement:
+    - Prefer Page.get_text_length (older / many builds)
+    - Fallback to module-level fitz.get_text_length (other builds)
+    - Last-resort heuristic if neither exists
+    """
+    # 1) Page.get_text_length(...)
+    if hasattr(page, "get_text_length"):
+        return page.get_text_length(text, fontname=fontname, fontsize=fontsize)
+
+    # 2) Module-level fitz.get_text_length(...)
+    if hasattr(fitz, "get_text_length"):
+        try:
+            return fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
+        except TypeError:
+            # some signatures are (text, fontsize, fontname)
+            return fitz.get_text_length(text, fontsize, fontname)
+
+    # 3) Heuristic fallback (approx)
+    return len(text) * fontsize * 0.5
+
+def _pick_fontfile() -> str | None:
+    for p in [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/Library/Fonts/Arial Unicode.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+    ]:
+        if os.path.exists(p): return p
+    return None  # falls back to Base14 Courier (monospace) which avoids overlap
+
+def _ensure_font(doc: fitz.Document) -> str:
+    # Prefer a Unicode TTF; else use a Base14 **monospace** (Courier) to avoid metric surprises
+    fontname = "Courier"  # safer than proportional when metrics APIs vary
+    ff = _pick_fontfile()
+    if ff:
+        try:
+            fontname = doc.insert_font(fontfile=ff)
+        except Exception:
+            fontname = "Courier"
+    return fontname
+
+def _sanitize_paragraphs(paragraphs: list[str]) -> list[str]:
+    out = []
+    for p in paragraphs:
+        # 1) normalize internal breaks / tabs → single spaces
+        p = p.replace("\r\n", "\n").replace("\r", "\n")
+        p = re.sub(r"[ \t\f\v]+", " ", p)
+        p = re.sub(r"\s*\n\s*", " ", p)           # collapse hard newlines inside a paragraph
+        # 2) collapse multiple spaces and trim
+        p = re.sub(r" {2,}", " ", p).strip()
+        out.append(p)
+    return out
+
 def write_pdf(paragraphs: list[str], out_path: str) -> str:
-    """
-    Create a simple text PDF from corrected paragraphs.
-    Handles PyMuPDF insert_textbox return quirks and ensures text is placed.
-    """
     doc = fitz.open()
-    # Use a standard paper size; switch to "a4" if you prefer
-    page_rect = fitz.paper_rect("letter")
-    margin = 56  # ~0.78 in
-    box = fitz.Rect(
-        page_rect.x0 + margin, page_rect.y0 + margin,
-        page_rect.x1 - margin, page_rect.y1 - margin
-    )
+    page_rect = fitz.paper_rect("a4")              # can change to "letter"
+    margin = 72                                     # 1 inch margin for safety
+    max_w = page_rect.width - 2 * margin
+    max_h = page_rect.height - 2 * margin
 
-    text = "\n\n".join(paragraphs).strip()
-    if not text:
-        # still emit a blank single-page PDF
-        doc.new_page(width=page_rect.width, height=page_rect.height)
-        doc.save(out_path)
-        doc.close()
-        return out_path
+    # Use sanitized text so hidden line-breaks can’t cause same-line redraws
+    paragraphs = _sanitize_paragraphs(paragraphs)
+    full_text = "\n\n".join(paragraphs).strip()
 
-    fontsize = 11
-    lineheight = fontsize * 1.4
-    fontname = "helv"  # built-in Helvetica; you can also try "Helvetica"
+    page = doc.new_page(width=page_rect.width, height=page_rect.height)
+    fontname = _ensure_font(doc)
+    fontsize = 12.0                                  # slightly larger → clearer
+    leading = fontsize * 1.6                         # generous line height (prevents overlap)
 
-    remaining: str | None = text
-    while remaining:
-        page = doc.new_page(width=page_rect.width, height=page_rect.height)
-        res = page.insert_textbox(
-            box,
-            remaining,
-            fontname=fontname,
-            fontsize=fontsize,
-            lineheight=lineheight,
-            align=0,       # left
-            render_mode=0  # fill text (default)
-        )
+    if not full_text:
+        doc.save(out_path); doc.close(); return out_path
 
-        # Normalize return: some versions return leftover string,
-        # others return 0/0.0 if all placed, some return (n_written, leftover)
-        if isinstance(res, str):
-            remaining = res
-        elif isinstance(res, (int, float)):
-            # 0 / 0.0 means "everything fit"; keep no remainder
-            remaining = ""
-        elif isinstance(res, tuple) and len(res) >= 2 and isinstance(res[1], str):
-            remaining = res[1]
-        else:
-            # Assume done
-            remaining = ""
+    # Greedy wrap with cross-version width measurement (_measure_width)
+    def wrap_para(p: str) -> list[str]:
+        if not p: return [""]
+        words = p.split(" ")
+        lines, line = [], ""
+        for w in words:
+            cand = (line + " " + w).strip() if line else w
+            width = _measure_width(page, cand, fontname, fontsize)
+            if width <= max_w:
+                line = cand
+            else:
+                if line: lines.append(line)
+                line = w
+        if line: lines.append(line)
+        return lines
+
+    x, y = margin, margin
+    drew_anything = False
+
+    for para in full_text.split("\n\n"):
+        for line in wrap_para(para):
+            # If next baseline would exceed page bottom → new page
+            if y + leading > page_rect.height - margin:
+                page = doc.new_page(width=page_rect.width, height=page_rect.height)
+                y = margin
+            # Draw once per line; baseline strictly increases → no overlap possible
+            page.insert_text((x, y), line, fontname=fontname, fontsize=fontsize, render_mode=0)
+            y += leading
+            drew_anything = True
+        # extra breathing room between paragraphs
+        y += leading * 0.5
+
+    # Ensure non-empty PDF even if everything trimmed
+    if not drew_anything:
+        page.insert_text((margin, margin), " ", fontname=fontname, fontsize=fontsize)
 
     doc.save(out_path)
     doc.close()
