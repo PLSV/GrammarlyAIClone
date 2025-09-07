@@ -1,11 +1,20 @@
 # app/services/llm.py
-import json, os, time, re
+import json
+import os
+import time
+import re
+import logging
 from typing import List, Dict, Any
 
+log = logging.getLogger("llm")
+
 try:
-    # Official OpenAI 1.x client
+    # Official OpenAI 1.x client — with longer timeout & built-in retries
     from openai import OpenAI
-    _client = OpenAI()
+    _client = OpenAI(
+        timeout=60.0,   # more forgiving network timeout
+        max_retries=3,  # let the SDK retry transient failures
+    )
     _use_new = True
 except Exception:
     # Legacy 0.x fallback
@@ -22,12 +31,13 @@ SYSTEM = (
     "Do NOT merge or split list items.\n"
     "ONE INPUT SEGMENT = ONE OUTPUT SEGMENT.\n"
     "Return ONLY valid JSON with this exact shape:\n"
-    '{"rewrites":[{"index":int,"text":str}, ...]}\n'
+    '{"rewrites":[{"index":int,"text":str}]}\n'
     "No prose, no markdown, no extra keys."
 )
 
 # grab the last {...} block to be resilient to any prefacing text
 _JSON_FENCE = re.compile(r"\{.*\}\s*$", re.DOTALL)
+
 
 def _extract_json(text: str) -> dict:
     try:
@@ -39,34 +49,44 @@ def _extract_json(text: str) -> dict:
         return json.loads(m.group(0))
     raise ValueError("Model output was not valid JSON")
 
+
 def _chat(messages: list) -> str:
+    """Single call to OpenAI Chat Completions."""
+    log.info("LLM chat call model=%s, messages=%d", MODEL, len(messages))
     if _use_new:
+        # OpenAI 1.x client
         resp = _client.chat.completions.create(model=MODEL, messages=messages)
         return resp.choices[0].message.content or ""
     else:
+        # Legacy 0.x fallback
         _client.api_key = os.getenv("OPENAI_API_KEY")
         resp = _client.ChatCompletion.create(model=MODEL, messages=messages)
         return resp["choices"][0]["message"]["content"] or ""
+
 
 def rewrite_segments_with_gpt(
     segments: List[Dict[str, Any]],
     guidelines: str,
     max_retries: int = 2
 ) -> List[Dict[str, Any]]:
+    """
+    segments: [{index:int, kind:str, text:str}, ...]
+    returns:  [{index:int, text:str}, ...]
+    """
     payload = {
         "guidelines": guidelines,
         "segments": [
             {
-                "index": s["index"],
+                "index": int(s["index"]),
                 "kind": s.get("kind", "para"),
-                "text": s.get("text", "")
+                "text": s.get("text", ""),
             }
             for s in segments
         ],
     }
 
-    last_err = None
-    for _ in range(max_retries + 1):
+    last_err: Exception | None = None
+    for attempt in range(max_retries + 1):
         try:
             messages = [
                 {"role": "system", "content": SYSTEM},
@@ -77,9 +97,11 @@ def rewrite_segments_with_gpt(
             items = data.get("rewrites", [])
             return [
                 {"index": int(it["index"]), "text": str(it["text"])}
-                for it in items if isinstance(it, dict) and "index" in it and "text" in it
+                for it in items
+                if isinstance(it, dict) and "index" in it and "text" in it
             ]
         except Exception as e:
             last_err = e
-            time.sleep(0.6)
+            # exponential-ish backoff
+            time.sleep(1.0 + 0.75 * attempt)
     raise RuntimeError(f"LLM rewrite failed: {last_err}")
