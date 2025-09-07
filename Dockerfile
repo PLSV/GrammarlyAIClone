@@ -7,20 +7,23 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 WORKDIR /app
 
-# Build-time + common runtime libs
+# Build-time tools + shared libs needed to build wheels
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential gcc \
     libmagic1 default-jre-headless \
     fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy pinned dependencies first to leverage layer cache
+# Copy requirements first to leverage caching
 COPY requirements.txt .
 
-# Prebuild wheels for all deps (incl. spaCy model via URL if listed in requirements)
-# If you're not pinning the model in requirements, you can ARG it and wheel it here.
+# (Optional) spaCy model wheel to avoid runtime downloads
+ARG SPACY_MODEL_URL="https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl"
+
+# Prebuild all wheels
 RUN python -m pip install --upgrade pip wheel setuptools && \
-    pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
+    pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt && \
+    pip wheel --no-cache-dir --wheel-dir /wheels "${SPACY_MODEL_URL}"
 
 # =============================
 # Stage 2 — runtime (slim)
@@ -29,35 +32,32 @@ FROM python:3.10-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     DEBIAN_FRONTEND=noninteractive \
-    PORT=8000 \
-    PIP_ROOT_USER_ACTION=ignore
+    PORT=8000
 
 WORKDIR /app
 
-# Runtime libs only
+# Runtime deps (no compilers here)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libmagic1 default-jre-headless \
     fonts-dejavu-core \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy prebuilt wheels
+# Non-root user
+RUN useradd -m appuser
+
+# Copy prebuilt wheels and install them as root (so site-packages is writeable),
+# then clean the wheels dir to avoid the previous permission errors on rm.
 COPY --from=builder /wheels /wheels
+RUN pip install --no-cache-dir /wheels/* && rm -rf /wheels
 
-# *** Ensure we are root for system-site install + cleanup ***
-USER root
-RUN pip install --no-cache-dir --no-user /wheels/* && rm -rf /wheels
-
-# Create a non-root user and hand over ownership of /app
-RUN adduser --disabled-password --gecos "" appuser && chown -R appuser:appuser /app
-
-# Copy project source after user is created; /app is already owned by appuser
+# Copy app source after deps to maximize layer cache
 COPY . .
 
-# Data dir for uploads
+# Prepare data directory
 RUN mkdir -p /app/data && chown -R appuser:appuser /app/data
 
-# Drop privileges AFTER deps are installed and cleanup done
+# Drop privileges
 USER appuser
 
 EXPOSE 8000
