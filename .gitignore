@@ -1,0 +1,23 @@
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# OS cruft
+.DS_Store
+
+# App data (uploads, generated outputs)
+data/*
+!data/.gitkeep   # keep the folder itself (optional, use an empty .gitkeep)
+
+# Build / env
+dist/
+build/
+.venv/
+.env
